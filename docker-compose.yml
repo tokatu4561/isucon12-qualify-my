@@ -1,4 +1,4 @@
-version: '3.0'
+version: "3.0"
 
 services:
   nginx:
@@ -7,6 +7,7 @@ services:
       - ./nginx/conf.d:/etc/nginx/conf.d
       - ./nginx/tls:/etc/nginx/tls
       - ./public:/public
+      - ./nginx/logs:/var/log/nginx
     ports:
       - "443:443"
     network_mode: host

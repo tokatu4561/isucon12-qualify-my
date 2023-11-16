@@ -27,6 +27,7 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/rs/xid"
 )
 
 const (
@@ -73,6 +74,8 @@ func connectAdminDB() (*sqlx.DB, error) {
 // テナントDBのパスを返す
 func tenantDBPath(id int64) string {
 	tenantDBDir := getEnv("ISUCON_TENANT_DB_DIR", "../tenant_db")
+	// filepath join とは 例えば
+	// filepath.Join("a", "b", "c") は "a/b/c" を返す
 	return filepath.Join(tenantDBDir, fmt.Sprintf("%d.db", id))
 }
 
@@ -99,28 +102,30 @@ func createTenantDB(id int64) error {
 
 // システム全体で一意なIDを生成する
 func dispenseID(ctx context.Context) (string, error) {
-	var id int64
-	var lastErr error
-	for i := 0; i < 100; i++ {
-		var ret sql.Result
-		ret, err := adminDB.ExecContext(ctx, "REPLACE INTO id_generator (stub) VALUES (?);", "a")
-		if err != nil {
-			if merr, ok := err.(*mysql.MySQLError); ok && merr.Number == 1213 { // deadlock
-				lastErr = fmt.Errorf("error REPLACE INTO id_generator: %w", err)
-				continue
-			}
-			return "", fmt.Errorf("error REPLACE INTO id_generator: %w", err)
-		}
-		id, err = ret.LastInsertId()
-		if err != nil {
-			return "", fmt.Errorf("error ret.LastInsertId: %w", err)
-		}
-		break
-	}
-	if id != 0 {
-		return fmt.Sprintf("%x", id), nil
-	}
-	return "", lastErr
+	guid := xid.New()
+	return guid.String(), nil
+	// var id int64
+	// var lastErr error
+	// for i := 0; i < 100; i++ {
+	// 	var ret sql.Result
+	// 	ret, err := adminDB.ExecContext(ctx, "REPLACE INTO id_generator (stub) VALUES (?);", "a")
+	// 	if err != nil {
+	// 		if merr, ok := err.(*mysql.MySQLError); ok && merr.Number == 1213 { // deadlock
+	// 			lastErr = fmt.Errorf("error REPLACE INTO id_generator: %w", err)
+	// 			continue
+	// 		}
+	// 		return "", fmt.Errorf("error REPLACE INTO id_generator: %w", err)
+	// 	}
+	// 	id, err = ret.LastInsertId()
+	// 	if err != nil {
+	// 		return "", fmt.Errorf("error ret.LastInsertId: %w", err)
+	// 	}
+	// 	break
+	// }
+	// if id != 0 {
+	// 	return fmt.Sprintf("%x", id), nil
+	// }
+	// return "", lastErr
 }
 
 // 全APIにCache-Control: privateを設定する
@@ -624,6 +629,7 @@ type TenantsBillingHandlerResult struct {
 // テナントごとの課金レポートを最大10件、テナントのid降順で取得する
 // GET /api/admin/tenants/billing
 // URL引数beforeを指定した場合、指定した値よりもidが小さいテナントの課金レポートを取得する
+// TODO: 下記が重いので改善する
 func tenantsBillingHandler(c echo.Context) error {
 	if host := c.Request().Host; host != getEnv("ISUCON_ADMIN_HOSTNAME", "admin.t.isucon.dev") {
 		return echo.NewHTTPError(
@@ -662,7 +668,12 @@ func tenantsBillingHandler(c echo.Context) error {
 		return fmt.Errorf("error Select tenant: %w", err)
 	}
 	tenantBillings := make([]TenantWithBilling, 0, len(ts))
+
+
+	// FIXME: ここで大会ごとの課金レポートを計算するのは重いので改善する
+	// 具体的には N + 1 問題を解消する
 	for _, t := range ts {
+		// beforeIDが指定されている場合は、指定されたIDよりも小さいテナントの課金レポートは取得しない
 		if beforeID != 0 && beforeID <= t.ID {
 			continue
 		}
@@ -672,11 +683,15 @@ func tenantsBillingHandler(c echo.Context) error {
 				Name:        t.Name,
 				DisplayName: t.DisplayName,
 			}
+
+			// TODO: N + 1 
 			tenantDB, err := connectToTenantDB(t.ID)
 			if err != nil {
 				return fmt.Errorf("failed to connectToTenantDB: %w", err)
 			}
 			defer tenantDB.Close()
+
+			// TODO: N + 1 
 			cs := []CompetitionRow{}
 			if err := tenantDB.SelectContext(
 				ctx,
@@ -1098,6 +1113,9 @@ func competitionScoreHandler(c echo.Context) error {
 		})
 	}
 
+	// upsert で書き換える
+
+
 	if _, err := tenantDB.ExecContext(
 		ctx,
 		"DELETE FROM player_score WHERE tenant_id = ? AND competition_id = ?",
@@ -1189,6 +1207,7 @@ type PlayerHandlerResult struct {
 // 参加者向けAPI
 // GET /api/player/player/:player_id
 // 参加者の詳細情報を取得する
+// TODO: 下記のアクセスが多い /api/player/player/
 func playerHandler(c echo.Context) error {
 	ctx := context.Background()
 
@@ -1238,6 +1257,7 @@ func playerHandler(c echo.Context) error {
 	}
 	defer fl.Close()
 	pss := make([]PlayerScoreRow, 0, len(cs))
+	// N + 1
 	for _, c := range cs {
 		ps := PlayerScoreRow{}
 		if err := tenantDB.GetContext(
@@ -1300,6 +1320,7 @@ type CompetitionRankingHandlerResult struct {
 // 参加者向けAPI
 // GET /api/player/competition/:competition_id/ranking
 // 大会ごとのランキングを取得する
+// TODO: 下記のアクセス回数が多い
 func competitionRankingHandler(c echo.Context) error {
 	ctx := context.Background()
 	v, err := parseViewer(c)
@@ -1316,10 +1337,12 @@ func competitionRankingHandler(c echo.Context) error {
 	}
 	defer tenantDB.Close()
 
+	// middlewareでチェックして欲しい
 	if err := authorizePlayer(ctx, tenantDB, v.playerID); err != nil {
 		return err
 	}
 
+	// 大会の存在確認
 	competitionID := c.Param("competition_id")
 	if competitionID == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "competition_id is required")
@@ -1366,48 +1389,78 @@ func competitionRankingHandler(c echo.Context) error {
 	}
 	defer fl.Close()
 	pss := []PlayerScoreRow{}
+	//TODO: このクエリが重いので改善する インデックスを貼る
 	if err := tenantDB.SelectContext(
 		ctx,
 		&pss,
-		"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC",
+		"SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY score DESC row_num DESC LIMIT 100 OFFSET ?",
 		tenant.ID,
 		competitionID,
+		rankAfter,
 	); err != nil {
 		return fmt.Errorf("error Select player_score: tenantID=%d, competitionID=%s, %w", tenant.ID, competitionID, err)
 	}
 	ranks := make([]CompetitionRank, 0, len(pss))
 	scoredPlayerSet := make(map[string]struct{}, len(pss))
+
+	scoredPlayerIds := make([]string, 0, len(pss))
 	for _, ps := range pss {
+		scoredPlayerIds = append(scoredPlayerIds, ps.PlayerID)
+	}
+	ppr := []PlayerRow{}
+	getPlayersSql := fmt.Sprintf("SELECT * FROM player WHERE id IN (%s)", strings.Join(scoredPlayerIds, ","))
+	if err := tenantDB.SelectContext(ctx, &ppr, getPlayersSql); err != nil {
+		return fmt.Errorf("error Select player: %w", err)
+	}
+
+	for i, ps := range pss {
 		// player_scoreが同一player_id内ではrow_numの降順でソートされているので
 		// 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
+		// row_numとは何か
 		if _, ok := scoredPlayerSet[ps.PlayerID]; ok {
 			continue
 		}
 		scoredPlayerSet[ps.PlayerID] = struct{}{}
-		p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
+
+		// TODO: N + 1
+		// p, err := retrievePlayer(ctx, tenantDB, ps.PlayerID)
+		var p PlayerRow
+		for _, pp := range ppr {
+			if pp.ID == ps.PlayerID {
+				p = pp
+				break
+			}
+		}
+		
 		if err != nil {
 			return fmt.Errorf("error retrievePlayer: %w", err)
 		}
 		ranks = append(ranks, CompetitionRank{
+			Rank:              rankAfter + int64(i) + 1, // 
 			Score:             ps.Score,
 			PlayerID:          p.ID,
 			PlayerDisplayName: p.DisplayName,
 			RowNum:            ps.RowNum,
 		})
 	}
+
+	// FIXME: sql でソートしたので後で消す
+	// ソート スコアの降順、row_numの昇順 	
 	sort.Slice(ranks, func(i, j int) bool {
 		if ranks[i].Score == ranks[j].Score {
 			return ranks[i].RowNum < ranks[j].RowNum
 		}
 		return ranks[i].Score > ranks[j].Score
 	})
+	// ページング
+	// FIXME: 全件取得してからページングするのは重いので改善する
 	pagedRanks := make([]CompetitionRank, 0, 100)
 	for i, rank := range ranks {
 		if int64(i) < rankAfter {
 			continue
 		}
 		pagedRanks = append(pagedRanks, CompetitionRank{
-			Rank:              int64(i + 1),
+			Rank:              rankAfter + int64(i) + 1, // 
 			Score:             rank.Score,
 			PlayerID:          rank.PlayerID,
 			PlayerDisplayName: rank.PlayerDisplayName,

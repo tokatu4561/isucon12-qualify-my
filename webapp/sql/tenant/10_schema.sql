@@ -28,5 +28,7 @@ CREATE TABLE player_score (
   score BIGINT NOT NULL,
   row_num BIGINT NOT NULL,
   created_at BIGINT NOT NULL,
-  updated_at BIGINT NOT NULL
+  updated_at BIGINT NOT NULL,
 );
+
+CREATE INDEX player_competition_tenant_score_idx on player_score (tenant_id, competition_id, score);
